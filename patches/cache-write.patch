@@ -1,0 +1,298 @@
+From 9001f6c33e734202a8157f16fd777bbe31b0a74b Mon Sep 17 00:00:00 2001
+From: zhangtianshu <zhang_tianshu@outlook.com>
+Date: Mon, 9 Nov 2026 00:01:24 +0800
+Subject: [PATCH] build: devin token accounting patch for v8.0.64
+
+---
+ internal/runtime/executor/devin_executor.go   | 77 +++++++++++++------
+ .../runtime/executor/devin_executor_test.go   | 28 ++++---
+ internal/runtime/executor/helps/devin_wire.go | 25 ++++++
+ .../runtime/executor/helps/devin_wire_test.go | 46 +++++++++++
+ 4 files changed, 139 insertions(+), 37 deletions(-)
+
+diff --git a/internal/runtime/executor/devin_executor.go b/internal/runtime/executor/devin_executor.go
+index 0bc7587d..88e2cc99 100644
+--- a/internal/runtime/executor/devin_executor.go
++++ b/internal/runtime/executor/devin_executor.go
+@@ -28,6 +28,7 @@ import (
+ 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+ 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+ 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
++	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
+ 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
+ 	log "github.com/sirupsen/logrus"
+ )
+@@ -295,6 +296,10 @@ func (e *DevinExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
+ 		patchDiagnostics = respLog.ApplyPatchDiagnostics
+ 	}
+ 	if errConsume != nil {
++		var accountingErr devinTokenAccountingError
++		if errors.As(errConsume, &accountingErr) {
++			reporter.PublishFailureWithDetail(ctx, usage.Detail{TokenBreakdown: accountingErr.breakdown}, errConsume)
++		}
+ 		original := opts.OriginalRequest
+ 		if len(original) == 0 {
+ 			original = req.Payload
+@@ -1231,20 +1236,19 @@ func (e *DevinExecutor) streamDevinFramesForAuth(
+ 		_ = completedDoc.Set("interaction.finish_reason", completionFinishReason)
+ 	}
+ 	if finalUsage != nil {
+-		totalInput := devinTotalInputTokens(finalUsage)
+-		totalOutput := finalUsage.CompletionTokens
+-		totalTokens := totalInput + totalOutput
+-
+-		_ = completedDoc.Set("interaction.usage.total_input_tokens", totalInput)
+-		_ = completedDoc.Set("interaction.usage.total_output_tokens", totalOutput)
+-		_ = completedDoc.Set("interaction.usage.total_cached_tokens", finalUsage.CachedTokens)
+-		if finalUsage.CacheWriteTokens > 0 {
+-			_ = completedDoc.Set("interaction.usage.cache_write_tokens", finalUsage.CacheWriteTokens)
+-		}
+-		_ = completedDoc.Set("interaction.usage.total_tokens", totalTokens)
+ 		if reporter != nil && finalUsage.ModelName != "" {
+ 			reporter.SetResponseModel(finalUsage.ModelName)
+ 		}
++		breakdown, ok := helps.DevinTokenBreakdown(finalUsage)
++		if !ok {
++			accountingErr := newDevinTokenAccountingError(breakdown)
++			if reporter != nil {
++				reporter.PublishFailureWithDetail(ctx, usage.Detail{TokenBreakdown: breakdown}, accountingErr)
++			}
++			emitStreamError(accountingErr)
++			return
++		}
++		writeDevinCanonicalUsage(completedDoc, "interaction.usage.", breakdown, finalUsage)
+ 	}
+ 	completedEvent := completedDoc.Bytes()
+ 	if !emitInteractionsEvent(completedEvent) {
+@@ -1303,6 +1307,30 @@ func consumeDevinFramesToInteractions(body io.Reader, model, chatModelUID string
+ 	return consumeDevinFramesToInteractionsForAuth(body, model, chatModelUID, nil, original...)
+ }
+ 
++// devinTokenAccountingError is the safe 502 for Devin counters that cannot form a
++// valid complete breakdown. breakdown is the helper's inconsistent result.
++type devinTokenAccountingError struct {
++	statusErr
++	breakdown usage.TokenBreakdown
++}
++
++func newDevinTokenAccountingError(breakdown usage.TokenBreakdown) devinTokenAccountingError {
++	return devinTokenAccountingError{
++		statusErr: statusErr{code: http.StatusBadGateway, msg: "invalid Devin token accounting"},
++		breakdown: breakdown,
++	}
++}
++
++func writeDevinCanonicalUsage(doc *ojson.Doc, prefix string, breakdown usage.TokenBreakdown, wire *helps.DevinUsage) {
++	_ = doc.Set(prefix+"total_input_tokens", breakdown.Input.TotalTokens)
++	_ = doc.Set(prefix+"total_output_tokens", breakdown.Output.TotalTokens)
++	_ = doc.Set(prefix+"total_cached_tokens", wire.CachedTokens)
++	if wire.CacheWriteTokens > 0 {
++		_ = doc.Set(prefix+"cache_write_tokens", wire.CacheWriteTokens)
++	}
++	_ = doc.Set(prefix+"total_tokens", breakdown.TotalTokens)
++}
++
+ func consumeDevinFramesToInteractionsForAuth(body io.Reader, model, chatModelUID string, auth *cliproxyauth.Auth, original ...[]byte) ([]byte, *helps.DevinUpstreamResponseLog, error) {
+ 	interactionID := fmt.Sprintf("interaction_%s", uuid.New().String()[:12])
+ 	var preToolTextParts []string
+@@ -1662,17 +1690,22 @@ func consumeDevinFramesToInteractionsForAuth(body io.Reader, model, chatModelUID
+ 	}
+ 
+ 	if finalUsage != nil {
+-		totalInput := devinTotalInputTokens(finalUsage)
+-		totalOutput := finalUsage.CompletionTokens
+-		totalTokens := totalInput + totalOutput
+-
+-		_ = outDoc.Set("usage.total_input_tokens", totalInput)
+-		_ = outDoc.Set("usage.total_output_tokens", totalOutput)
+-		_ = outDoc.Set("usage.total_cached_tokens", finalUsage.CachedTokens)
+-		if finalUsage.CacheWriteTokens > 0 {
+-			_ = outDoc.Set("usage.cache_write_tokens", finalUsage.CacheWriteTokens)
+-		}
+-		_ = outDoc.Set("usage.total_tokens", totalTokens)
++		breakdown, ok := helps.DevinTokenBreakdown(finalUsage)
++		if !ok {
++			respLog := &helps.DevinUpstreamResponseLog{
++				Status:        "invalid_token_accounting",
++				FramesCount:   framesCount,
++				Content:       getAllContentText(),
++				Thinking:      strings.Join(thinkingParts, ""),
++				Signature:     string(accumulatedSignature),
++				SignatureType: signatureType,
++				ToolCalls:     toolCalls,
++				Usage:         finalUsage,
++				UnknownFields: unknownFields,
++			}
++			return nil, respLog, newDevinTokenAccountingError(breakdown)
++		}
++		writeDevinCanonicalUsage(outDoc, "usage.", breakdown, finalUsage)
+ 	}
+ 	out := outDoc.Bytes()
+ 
+diff --git a/internal/runtime/executor/devin_executor_test.go b/internal/runtime/executor/devin_executor_test.go
+index bca8e767..ee6d4af7 100644
+--- a/internal/runtime/executor/devin_executor_test.go
++++ b/internal/runtime/executor/devin_executor_test.go
+@@ -21,7 +21,6 @@ import (
+ 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+ 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+ 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+-	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
+ 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
+ 	log "github.com/sirupsen/logrus"
+ 	logtest "github.com/sirupsen/logrus/hooks/test"
+@@ -3197,22 +3196,23 @@ func TestRegressionIssue5910_UsageStatsCacheWriteTokensInResponses(t *testing.T)
+ 	}
+ 
+ 	root := ojson.ParseBytes(interactionsJSON)
+-	// total input = uncached 3 + cache read 50 + cache write 14361
+ 	if root.Get("usage.total_input_tokens").Int() != 14414 {
+ 		t.Errorf("usage.total_input_tokens = %d, want 14414", root.Get("usage.total_input_tokens").Int())
+ 	}
++	if root.Get("usage.total_output_tokens").Int() != 10 {
++		t.Errorf("usage.total_output_tokens = %d, want 10", root.Get("usage.total_output_tokens").Int())
++	}
++	if root.Get("usage.total_tokens").Int() != 14424 {
++		t.Errorf("usage.total_tokens = %d, want 14424", root.Get("usage.total_tokens").Int())
++	}
+ 	if root.Get("usage.cache_write_tokens").Int() != 14361 {
+ 		t.Errorf("usage.cache_write_tokens = %d, want 14361", root.Get("usage.cache_write_tokens").Int())
+ 	}
+ 	detail := helps.ParseInteractionsUsage(interactionsJSON)
+-	if detail.CacheCreationTokens != 14361 {
+-		t.Errorf("ParseInteractionsUsage CacheCreationTokens = %d, want 14361", detail.CacheCreationTokens)
+-	}
+-	if detail.InputTokens != 14414 {
+-		t.Errorf("ParseInteractionsUsage InputTokens = %d, want 14414", detail.InputTokens)
+-	}
+-	if detail.TokenBreakdown.Quality != usage.TokenAccountingQualityComplete || detail.TokenBreakdown.Input.UncachedTokens != 3 {
+-		t.Errorf("token breakdown = %+v, want complete with 3 uncached", detail.TokenBreakdown)
++	if detail.CacheCreationTokens != 14361 || detail.InputTokens != 14414 || detail.TotalTokens != 14424 ||
++		detail.TokenBreakdown.Input.CacheWriteTokens != 14361 || detail.TokenBreakdown.Input.UncachedTokens != 3 ||
++		detail.TokenBreakdown.Quality != "complete" {
++		t.Errorf("ParseInteractionsUsage detail = %+v", detail)
+ 	}
+ 
+ 	// 2. Streaming test
+@@ -3270,11 +3270,9 @@ func TestRegressionIssue5910_UsageStatsCacheWriteTokensInResponses(t *testing.T)
+ 	if sDetail.CacheCreationTokens != 14361 {
+ 		t.Errorf("ParseInteractionsStreamUsage CacheCreationTokens = %d, want 14361", sDetail.CacheCreationTokens)
+ 	}
+-	if sDetail.InputTokens != 14414 {
+-		t.Errorf("ParseInteractionsStreamUsage InputTokens = %d, want 14414", sDetail.InputTokens)
+-	}
+-	if got := cRoot.Get("interaction.usage.total_input_tokens").Int(); got != 14414 {
+-		t.Errorf("interaction.usage.total_input_tokens = %d, want 14414", got)
++	if sDetail.InputTokens != 14414 || sDetail.TotalTokens != 14424 ||
++		sDetail.TokenBreakdown.Input.CacheWriteTokens != 14361 || sDetail.TokenBreakdown.Quality != "complete" {
++		t.Errorf("ParseInteractionsStreamUsage detail = %+v", sDetail)
+ 	}
+ }
+ 
+diff --git a/internal/runtime/executor/helps/devin_wire.go b/internal/runtime/executor/helps/devin_wire.go
+index ecebd412..568d94a5 100644
+--- a/internal/runtime/executor/helps/devin_wire.go
++++ b/internal/runtime/executor/helps/devin_wire.go
+@@ -22,6 +22,7 @@ import (
+ 	"github.com/router-for-me/CLIProxyAPI/v8/internal/cache"
+ 	translatorcommon "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/common"
+ 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
++	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
+ 	"google.golang.org/protobuf/encoding/protowire"
+ )
+ 
+@@ -110,6 +111,30 @@ type DevinUsage struct {
+ 	Headers          map[string]string `json:"headers,omitempty"`
+ }
+ 
++// DevinTokenBreakdown maps Devin wire counters onto independent canonical buckets.
++// Tag 2 is uncached input, tag 5 is cache read, tag 4 is cache write, and tag 3 is
++// ordinary output. This protocol reports no separate reasoning count.
++// A nil usage, a negative counter, int64 overflow, or any result that is not a
++// valid complete breakdown returns false. The breakdown from the shared constructor
++// is returned unchanged so a caller can publish the inconsistent accounting.
++func DevinTokenBreakdown(u *DevinUsage) (usage.TokenBreakdown, bool) {
++	if u == nil {
++		return usage.TokenBreakdown{}, false
++	}
++	breakdown := usage.NewIndependentTokenBreakdown(
++		u.PromptTokens,
++		u.CachedTokens,
++		u.CacheWriteTokens,
++		u.CompletionTokens,
++		0,
++		0,
++	)
++	if breakdown.Quality != usage.TokenAccountingQualityComplete || !breakdown.Valid() {
++		return breakdown, false
++	}
++	return breakdown, true
++}
++
+ // DevinFrameResult represents decoded content from a single Connect-proto frame.
+ type DevinFrameResult struct {
+ 	OutputID                string
+diff --git a/internal/runtime/executor/helps/devin_wire_test.go b/internal/runtime/executor/helps/devin_wire_test.go
+index 176f884b..b83feb15 100644
+--- a/internal/runtime/executor/helps/devin_wire_test.go
++++ b/internal/runtime/executor/helps/devin_wire_test.go
+@@ -7,6 +7,7 @@ import (
+ 	"testing"
+ 
+ 	"github.com/google/uuid"
++	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
+ 	"google.golang.org/protobuf/encoding/protowire"
+ )
+ 
+@@ -1036,3 +1037,48 @@ func TestBuildDevinGetChatMessageRequest_ObfuscatesEmbeddedExecDescriptions(t *t
+ 		}
+ 	}
+ }
++
++func TestDevinTokenBreakdown(t *testing.T) {
++	breakdown, ok := DevinTokenBreakdown(nil)
++	if ok || breakdown.Quality == usage.TokenAccountingQualityComplete || breakdown.Valid() {
++		t.Fatalf("nil usage ok=%v breakdown=%+v", ok, breakdown)
++	}
++
++	cases := []struct {
++		name     string
++		usage    DevinUsage
++		input    int64
++		output   int64
++		total    int64
++		uncached int64
++		read     int64
++		write    int64
++	}{
++		{name: "no cache write", usage: DevinUsage{PromptTokens: 8, CompletionTokens: 4}, input: 8, output: 4, total: 12, uncached: 8},
++		{name: "cache write below uncached input", usage: DevinUsage{PromptTokens: 10, CachedTokens: 50, CacheWriteTokens: 3, CompletionTokens: 2}, input: 63, output: 2, total: 65, uncached: 10, read: 50, write: 3},
++		{name: "cache write above uncached input", usage: DevinUsage{PromptTokens: 3, CachedTokens: 50, CacheWriteTokens: 14361, CompletionTokens: 10}, input: 14414, output: 10, total: 14424, uncached: 3, read: 50, write: 14361},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			got, gotOK := DevinTokenBreakdown(&tc.usage)
++			if !gotOK || !got.Valid() || got.Quality != usage.TokenAccountingQualityComplete ||
++				got.Input.TotalTokens != tc.input || got.Input.UncachedTokens != tc.uncached ||
++				got.Input.CacheReadTokens != tc.read || got.Input.CacheWriteTokens != tc.write ||
++				got.Output.TotalTokens != tc.output || got.Output.NonReasoningTokens != tc.output ||
++				got.Output.ReasoningTokens != 0 || got.UnclassifiedTokens != 0 || got.TotalTokens != tc.total {
++				t.Fatalf("ok=%v breakdown=%+v", gotOK, got)
++			}
++		})
++	}
++
++	rejected := []DevinUsage{
++		{PromptTokens: -1, CompletionTokens: 4},
++		{PromptTokens: math.MaxInt64, CacheWriteTokens: 1, CompletionTokens: 10},
++	}
++	for _, usageValue := range rejected {
++		got, gotOK := DevinTokenBreakdown(&usageValue)
++		if gotOK || got.Quality != usage.TokenAccountingQualityInconsistent || !got.Valid() {
++			t.Fatalf("ok=%v breakdown=%+v", gotOK, got)
++		}
++	}
++}
+-- 
+2.56.0
+

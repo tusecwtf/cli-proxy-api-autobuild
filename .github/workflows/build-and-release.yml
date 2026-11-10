@@ -1,0 +1,93 @@
+name: CI/CD Build and Release
+on:
+  schedule:
+    - cron: '30 19 * * *' # 03:30 CST
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Builder Repo
+        uses: actions/checkout@v4
+        with:
+          path: autobuild
+
+      - name: Fetch Latest Upstream Release
+        id: upstream
+        run: |
+          TAG=$(curl -s https://api.github.com/repos/router-for-me/CLIProxyAPI/releases/latest | jq -r .tag_name)
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Latest upstream tag is $TAG"
+
+      - name: Check if Release Exists
+        id: check_release
+        run: |
+          TARGET_TAG="${{ steps.upstream.outputs.tag }}-cachewrite.1"
+          EXISTS=$(curl -s -o /dev/null -w "%{http_code}" https://api.github.com/repos/${{ github.repository }}/releases/tags/$TARGET_TAG)
+          if [ "$EXISTS" = "200" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "Release $TARGET_TAG already exists, skipping."
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "Release $TARGET_TAG does not exist, building."
+          fi
+
+      - name: Checkout Upstream Code
+        if: steps.check_release.outputs.exists == 'false'
+        uses: actions/checkout@v4
+        with:
+          repository: router-for-me/CLIProxyAPI
+          ref: ${{ steps.upstream.outputs.tag }}
+          path: upstream
+
+      - name: Setup Go
+        if: steps.check_release.outputs.exists == 'false'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: Apply Patch and Run Tests
+        if: steps.check_release.outputs.exists == 'false'
+        run: |
+          cd upstream
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git apply --3way ../autobuild/patches/cache-write.patch
+          
+          # Run verification tests
+          go test -v ./internal/runtime/executor/helps -run TestDevinTokenBreakdown
+          go test -v ./internal/runtime/executor -run TestRegressionIssue5910
+
+      - name: Build Static Binary
+        if: steps.check_release.outputs.exists == 'false'
+        run: |
+          cd upstream
+          TARGET_VER="${{ steps.upstream.outputs.tag }}-cachewrite.1"
+          COMMIT=$(git rev-parse --short HEAD)
+          BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildvcs=false \
+            -ldflags="-s -w -X main.Version=${TARGET_VER#v} -X main.Commit=${COMMIT}+cachewrite.1 -X main.BuildDate=${BUILD_DATE}" \
+            -o ../cli-proxy-api ./cmd/server/
+            
+          cd ..
+          chmod +x cli-proxy-api
+          sha256sum cli-proxy-api > checksums.txt
+
+      - name: Create Release
+        if: steps.check_release.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.upstream.outputs.tag }}-cachewrite.1
+          name: ${{ steps.upstream.outputs.tag }}-cachewrite.1
+          body: |
+            Automated patched build for ${{ steps.upstream.outputs.tag }} with Devin token accounting and 502 conservation check.
+          files: |
+            cli-proxy-api
+            checksums.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
